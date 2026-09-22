@@ -1,8 +1,16 @@
-from fastapi import FastAPI
+"""服务入口：uvicorn main:app
 
-app = FastAPI()
+环境变量配置见 README.md（EDP_*）。本地存储默认位于 data/event_pipeline.db。
+"""
+from __future__ import annotations
 
+import logging
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+from app.api import create_app
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+app = create_app()
