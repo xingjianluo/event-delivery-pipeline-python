@@ -4,7 +4,9 @@
 - 缺省 / "succeed"：成功；
 - {"mode": "transient", "fail_times": N}：前 N 次抛 TransientError，之后成功；
 - {"mode": "business", "reason": ...}：始终业务拒绝；
-- {"mode": "unknown", "reason": ...}：始终抛不可归类异常。
+- {"mode": "unknown", "reason": ...}：始终抛不可归类异常；
+- {"mode": "slow", "delay": 秒数}：处理期间确定性睡眠（用于在真实进程上制造
+  “认领后、写终态前被 kill”的崩溃在途窗口），睡眠结束后成功。
 
 内存中的 success 计数仅用于演示/测试观测；副作用的**权威持久记录**
 是存储层 side_effects 表（与 SUCCEEDED 同事务，恰好一次）。
@@ -12,6 +14,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from app.errors import BusinessRejected, TransientError, UnknownFailure
 
@@ -33,6 +36,10 @@ class DownstreamHandler:
         if mode == "unknown":
             reason = sim.get("reason", "unclassifiable failure") if isinstance(sim, dict) else "unclassifiable failure"
             raise UnknownFailure(reason)
+        if mode == "slow":
+            delay = float(sim.get("delay", 1.0)) if isinstance(sim, dict) else 1.0
+            time.sleep(max(0.0, delay))
+            # 睡眠结束后落到下面的成功路径
 
         with self._lock:
             seen = self._attempts.get(event_id, 0) + 1

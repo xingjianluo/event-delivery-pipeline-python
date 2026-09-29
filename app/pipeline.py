@@ -12,7 +12,7 @@ from app.errors import classify, FailureKind
 from app.models import AcceptResult
 from app.retry import RetryPolicy
 from app.storage import Storage
-from app.tracing import new_correlation_id, use_correlation_id
+from app.tracing import new_correlation_id, normalize_trace_id, use_correlation_id
 
 log = logging.getLogger("event_pipeline.pipeline")
 
@@ -27,6 +27,10 @@ class ContentConflict(Exception):
         )
         self.existing_hash = existing_hash
         self.incoming_hash = incoming_hash
+
+
+class InvalidTraceId(ValueError):
+    """调用方追踪标识不合法（控制字符/超长）。"""
 
 
 def content_hash(event_type: str, payload: dict) -> str:
@@ -57,11 +61,22 @@ class Pipeline:
         event_type: str,
         payload: dict,
         now: float | None = None,
+        trace_id: str | None = None,
     ) -> AcceptResult:
+        """接收一个事件。
+
+        ``trace_id`` 为调用方自己的追踪标识（已由入口规范化）；未提供时服务端生成。
+        追踪标识在**首次写入**时持久化，此后接收去重、并发提交、进程重启都不会改变它：
+        重复提交即使携带了不同的标识，也返回首次持久化的值（``trace_id_mismatch=True``
+        仅作提示），绝不悄悄替换，因此调用方总能对上自己首次带进系统的那个值。
+        """
         now = time.time() if now is None else now
+        try:
+            requested = normalize_trace_id(trace_id)
+        except ValueError as exc:
+            raise InvalidTraceId(str(exc)) from exc
         chash = content_hash(event_type, payload)
-        # 重复提交沿用首次提交的关联标识（持久化在事件行上），不产生新处理
-        cid = new_correlation_id()
+        cid = requested or new_correlation_id()
         created, conflict = self.storage.insert_event_if_absent(
             event_id, event_type, payload, chash, cid, now
         )
@@ -73,13 +88,21 @@ class Pipeline:
             raise ContentConflict(event_id, conflict, chash)
         view = self.storage.get_event(event_id)
         assert view is not None
+        mismatch = (not created) and requested is not None and requested != view.correlation_id
+        if mismatch:
+            log.warning(
+                "duplicate submit with different trace_id event_id=%s "
+                "persisted=%s incoming=%s -> keeping persisted",
+                event_id, view.correlation_id, requested,
+            )
         log.info(
-            "receive event_id=%s cid=%s duplicate=%s state=%s",
-            event_id, view.correlation_id, not created, view.state.value,
+            "receive event_id=%s cid=%s duplicate=%s state=%s mismatch=%s",
+            event_id, view.correlation_id, not created, view.state.value, mismatch,
         )
         return AcceptResult(
             event_id=event_id, state=view.state, duplicate=not created,
-            correlation_id=view.correlation_id,
+            trace_id=view.correlation_id, correlation_id=view.correlation_id,
+            trace_id_mismatch=mismatch,
         )
 
     # -------------------------------------------------------------- delivery

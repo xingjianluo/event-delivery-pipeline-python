@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api import router
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, validate_settings
 from app.downstream import DownstreamHandler
 from app.pipeline import Pipeline
 from app.retry import RetryPolicy
@@ -22,6 +22,7 @@ logging.basicConfig(
 
 def create_app(settings: Settings | None = None, start_worker: bool = True) -> FastAPI:
     settings = settings or get_settings()
+    validate_settings(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

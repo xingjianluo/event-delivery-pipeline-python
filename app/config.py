@@ -31,4 +31,21 @@ def get_settings() -> Settings:
             kwargs[f.name] = env.strip().lower() in {"1", "true", "yes", "on"}
         else:
             kwargs[f.name] = type(default)(env)
-    return Settings(**kwargs)
+    settings = Settings(**kwargs)
+    validate_settings(settings)
+    return settings
+
+
+def validate_settings(settings: Settings) -> None:
+    """对运行参数做防御性校验：任何非法取值都应在启动时快速失败，而不是
+    在后台循环里表现为无限重认领或退避异常。"""
+    if settings.max_attempts < 1:
+        raise ValueError("EDP_MAX_ATTEMPTS must be >= 1 (first delivery counts)")
+    if settings.lease_timeout < 0:
+        raise ValueError("EDP_LEASE_TIMEOUT must be >= 0")
+    if settings.base_backoff < 0:
+        raise ValueError("EDP_BASE_BACKOFF must be >= 0")
+    if settings.backoff_factor < 1:
+        raise ValueError("EDP_BACKOFF_FACTOR must be >= 1")
+    if settings.poll_interval <= 0:
+        raise ValueError("EDP_POLL_INTERVAL must be > 0")

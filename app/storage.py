@@ -101,12 +101,30 @@ class Storage:
                     to_state       TEXT NOT NULL,
                     attempt        INTEGER NOT NULL,
                     reason         TEXT NOT NULL,
-                    actor          TEXT NOT NULL
+                    actor          TEXT NOT NULL,
+                    batch_id       TEXT
                 )
                 """
             )
+            # 轻量迁移：旧库的 event_history 没有 batch_id 列时补上
+            hist_cols = {r["name"] for r in c.execute("PRAGMA table_info(event_history)")}
+            if "batch_id" not in hist_cols:
+                c.execute("ALTER TABLE event_history ADD COLUMN batch_id TEXT")
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_history_event ON event_history(event_id, id)"
+            )
+            # 按调用方追踪标识反查（同一业务操作可关联多个事件，故非唯一索引）
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_correlation "
+                "ON events(correlation_id)"
+            )
+            # 运维按状态筛选 / 状态+追踪组合筛选
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_state ON events(state)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_state_cid "
+                "ON events(state, correlation_id)"
             )
             # 下游副作用登记表：event_id 为主键，保证每个事件至多登记一次
             c.execute(
@@ -114,6 +132,22 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS side_effects (
                     event_id TEXT PRIMARY KEY,
                     at       REAL NOT NULL
+                )
+                """
+            )
+            # 人工批量处置审计：每次批量请求一行（含 dry-run），历史行通过 batch_id 关联
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manual_batches (
+                    batch_id      TEXT PRIMARY KEY,
+                    action        TEXT NOT NULL,
+                    selector      TEXT NOT NULL,
+                    dry_run       INTEGER NOT NULL,
+                    matched       INTEGER NOT NULL,
+                    changed_count INTEGER NOT NULL,
+                    changed_ids   TEXT NOT NULL,
+                    actor         TEXT NOT NULL,
+                    at            REAL NOT NULL
                 )
                 """
             )
@@ -142,12 +176,15 @@ class Storage:
         attempt: int,
         reason: str,
         actor: str,
+        batch_id: str | None = None,
     ) -> None:
         c.execute(
             """INSERT INTO event_history
-               (event_id, correlation_id, at, from_state, to_state, attempt, reason, actor)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (event_id, correlation_id, at, from_state, to_state.value, attempt, reason, actor),
+               (event_id, correlation_id, at, from_state, to_state, attempt, reason,
+                actor, batch_id)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (event_id, correlation_id, at, from_state, to_state.value, attempt, reason,
+             actor, batch_id),
         )
         log.info(
             "transition event_id=%s cid=%s %s->%s attempt=%s actor=%s reason=%s",
@@ -210,6 +247,7 @@ class Storage:
             state=EventState(row["state"]),
             attempts=row["attempts"],
             max_attempts=row["max_attempts"],
+            trace_id=row["correlation_id"],
             correlation_id=row["correlation_id"],
             next_attempt_at=row["next_attempt_at"],
             last_error=row["last_error"],
@@ -224,41 +262,79 @@ class Storage:
 
         attempts 在认领时 +1（即投递尝试次数，含首次与崩溃后回收），
         状态迁移到 PROCESSING。返回事件 id；没有可投递事件返回 None。
+
+        崩溃循环收敛保证：回收一个超时租约时，若该事件的尝试次数已经达到
+        ``max_attempts``（例如 lease_timeout 被调到 0、worker 每轮都在写终态前
+        崩溃），则**不再重新认领**，而是直接把它隔离到 DEAD 终态（可查询、可人工
+        requeue）。这样在任何极端参数下，单条事件的认领次数都不会超过上限，
+        既不会无限重认领，也不会发生状态回退（PROCESSING -> DEAD 只进不退）。
+
+        本事务内的扫描循环必然终止：每跳过一条都是把一条陈旧的 PROCESSING 行
+        原子迁移为 DEAD（该行此后不再匹配候选查询），库内行数有限。
         """
         stale_before = now - self.settings.lease_timeout
+        max_attempts = self.settings.max_attempts
         with self._tx() as c:
-            row = c.execute(
-                """
-                SELECT event_id, state, attempts FROM events
-                WHERE (state = 'PENDING'
-                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-                   OR (state = 'PROCESSING' AND leased_at IS NOT NULL
-                       AND leased_at <= ?)
-                ORDER BY created_at, event_id
-                LIMIT 1
-                """,
-                (now, stale_before),
-            ).fetchone()
-            if row is None:
-                return None
-            event_id = row["event_id"]
-            prev = EventState(row["state"])
-            new_attempt = row["attempts"] + 1
-            c.execute(
-                """UPDATE events
-                   SET state='PROCESSING', attempts=?, lease_owner=?, leased_at=?,
-                       next_attempt_at=NULL, updated_at=?
-                   WHERE event_id=?""",
-                (new_attempt, correlation_id, now, now, event_id),
-            )
-            reason = "claimed for delivery" if prev is EventState.PENDING \
-                else "reclaimed after stale lease (worker crash/restart)"
-            self._history(
-                c, event_id=event_id, correlation_id=self._event_cid(c, event_id),
-                at=now, from_state=prev.value, to_state=EventState.PROCESSING,
-                attempt=new_attempt, reason=reason, actor=f"worker:{correlation_id}",
-            )
-            return event_id
+            while True:
+                row = c.execute(
+                    """
+                    SELECT event_id, state, attempts FROM events
+                    WHERE (state = 'PENDING'
+                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                       OR (state = 'PROCESSING' AND leased_at IS NOT NULL
+                           AND leased_at <= ?)
+                    ORDER BY created_at, event_id
+                    LIMIT 1
+                    """,
+                    (now, stale_before),
+                ).fetchone()
+                if row is None:
+                    return None
+                event_id = row["event_id"]
+                prev = EventState(row["state"])
+                new_attempt = row["attempts"] + 1
+                if (
+                    prev is EventState.PROCESSING
+                    and new_attempt >= max_attempts
+                ):
+                    # 崩溃/回收循环已用尽尝试次数：隔离到 DEAD，等待人工研判
+                    msg = (
+                        f"stale lease quarantined: attempt {new_attempt} reached "
+                        f"max_attempts={max_attempts} (worker crash/restart loop)"
+                    )
+                    c.execute(
+                        """UPDATE events
+                           SET state='DEAD', lease_owner=NULL, leased_at=NULL,
+                               next_attempt_at=NULL, last_error=?, failure_kind='transient',
+                               updated_at=?
+                           WHERE event_id=?""",
+                        (msg, now, event_id),
+                    )
+                    self._history(
+                        c, event_id=event_id,
+                        correlation_id=self._event_cid(c, event_id), at=now,
+                        from_state=EventState.PROCESSING.value, to_state=EventState.DEAD,
+                        attempt=new_attempt,
+                        reason="reclaimed stale lease but attempts exhausted; "
+                               "quarantined for manual review",
+                        actor=f"worker:{correlation_id}",
+                    )
+                    continue
+                c.execute(
+                    """UPDATE events
+                       SET state='PROCESSING', attempts=?, lease_owner=?, leased_at=?,
+                           next_attempt_at=NULL, updated_at=?
+                       WHERE event_id=?""",
+                    (new_attempt, correlation_id, now, now, event_id),
+                )
+                reason = "claimed for delivery" if prev is EventState.PENDING \
+                    else "reclaimed after stale lease (worker crash/restart)"
+                self._history(
+                    c, event_id=event_id, correlation_id=self._event_cid(c, event_id),
+                    at=now, from_state=prev.value, to_state=EventState.PROCESSING,
+                    attempt=new_attempt, reason=reason, actor=f"worker:{correlation_id}",
+                )
+                return event_id
 
     @staticmethod
     def _event_cid(c: sqlite3.Connection, event_id: str) -> str:
@@ -343,7 +419,13 @@ class Storage:
             return True
 
     # ------------------------------------------------------- manual disposal
-    def requeue(self, event_id: str, correlation_id: str, now: float) -> bool:
+    def requeue(
+        self,
+        event_id: str,
+        correlation_id: str,
+        now: float,
+        batch_id: str | None = None,
+    ) -> bool:
         with self._tx() as c:
             row = c.execute(
                 "SELECT * FROM events WHERE event_id=?", (event_id,)
@@ -361,11 +443,17 @@ class Storage:
                 c, event_id=event_id, correlation_id=row["correlation_id"], at=now,
                 from_state=row["state"], to_state=EventState.PENDING, attempt=0,
                 reason="manual requeue after review",
-                actor=f"manual:{correlation_id}",
+                actor=f"manual:{correlation_id}", batch_id=batch_id,
             )
             return True
 
-    def discard(self, event_id: str, correlation_id: str, now: float) -> bool:
+    def discard(
+        self,
+        event_id: str,
+        correlation_id: str,
+        now: float,
+        batch_id: str | None = None,
+    ) -> bool:
         with self._tx() as c:
             row = c.execute(
                 "SELECT * FROM events WHERE event_id=?", (event_id,)
@@ -381,9 +469,128 @@ class Storage:
                 c, event_id=event_id, correlation_id=row["correlation_id"], at=now,
                 from_state=row["state"], to_state=EventState.DISCARDED,
                 attempt=row["attempts"], reason="manual discard after review",
-                actor=f"manual:{correlation_id}",
+                actor=f"manual:{correlation_id}", batch_id=batch_id,
             )
             return True
+
+    def batch_dispose(
+        self,
+        *,
+        action: str,
+        event_ids: list[str],
+        correlation_id: str,
+        batch_id: str,
+        selector: str,
+        dry_run: bool,
+        now: float,
+    ) -> dict[str, Any]:
+        """对一批事件做人工 requeue/discard。
+
+        语义保证：
+        - **只动可人工处置的 DEAD/FAILED**：SUCCEEDED/PENDING/PROCESSING/DISCARDED
+          一律进入 ``skipped_terminal``，绝不卷入，已正常完成的事件不可能产生第二次副作用；
+        - **幂等**：重复执行同一批时，第二次没有可处置对象 -> changed 为空，不产生新副作用、
+          不产生新的状态迁移历史；
+        - **可审计**：非 dry-run 时在 ``manual_batches`` 落一行，每条历史迁移带 batch_id；
+        - 所有读取与迁移在**同一个 BEGIN IMMEDIATE 事务**内完成，与并发 worker/人工操作
+          互不踩踏（对非可处置状态的 UPDATE 条件天然不成立）。
+        """
+        if action not in {"requeue", "discard"}:
+            raise ValueError(f"unknown batch action: {action}")
+        disposable = {EventState.DEAD.value, EventState.FAILED.value}
+        changed: list[str] = []
+        skipped: list[str] = []
+        not_found: list[str] = []
+        with self._tx() as c:
+            for event_id in dict.fromkeys(event_ids):  # 去重但保序
+                row = c.execute(
+                    "SELECT state FROM events WHERE event_id=?", (event_id,)
+                ).fetchone()
+                if row is None:
+                    not_found.append(event_id)
+                    continue
+                if row["state"] not in disposable:
+                    skipped.append(event_id)
+                    continue
+                if dry_run:
+                    changed.append(event_id)
+                    continue
+                if action == "requeue":
+                    c.execute(
+                        """UPDATE events
+                           SET state='PENDING', attempts=0, lease_owner=NULL, leased_at=NULL,
+                               next_attempt_at=NULL, disposition='requeued', updated_at=?
+                           WHERE event_id=? AND state IN ('DEAD','FAILED')""",
+                        (now, event_id),
+                    )
+                    ev_cid = self._event_cid(c, event_id)
+                    self._history(
+                        c, event_id=event_id, correlation_id=ev_cid, at=now,
+                        from_state=row["state"], to_state=EventState.PENDING, attempt=0,
+                        reason=f"batch {action} after review",
+                        actor=f"manual:{correlation_id}", batch_id=batch_id,
+                    )
+                else:
+                    c.execute(
+                        """UPDATE events
+                           SET state='DISCARDED', disposition='discarded', updated_at=?
+                           WHERE event_id=? AND state IN ('DEAD','FAILED')""",
+                        (now, event_id),
+                    )
+                    ev_cid = self._event_cid(c, event_id)
+                    self._history(
+                        c, event_id=event_id, correlation_id=ev_cid, at=now,
+                        from_state=row["state"], to_state=EventState.DISCARDED,
+                        attempt=self._attempts_of(c, event_id),
+                        reason=f"batch {action} after review",
+                        actor=f"manual:{correlation_id}", batch_id=batch_id,
+                    )
+                changed.append(event_id)
+            if not dry_run:
+                c.execute(
+                    """INSERT INTO manual_batches
+                       (batch_id, action, selector, dry_run, matched, changed_count,
+                        changed_ids, actor, at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        batch_id, action, selector, 0, len(changed), len(changed),
+                        json.dumps(changed, ensure_ascii=False), correlation_id, now,
+                    ),
+                )
+        return {
+            "batch_id": batch_id,
+            "action": action,
+            "dry_run": dry_run,
+            "matched": len(changed),
+            "changed": changed,
+            "unchanged": sorted(skipped + not_found),
+            "skipped_terminal": skipped,
+            "not_found": not_found,
+        }
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with self._write_lock:
+            row = self.conn.execute(
+                "SELECT * FROM manual_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "batch_id": row["batch_id"],
+            "action": row["action"],
+            "selector": row["selector"],
+            "dry_run": bool(row["dry_run"]),
+            "matched": row["matched"],
+            "changed_count": row["changed_count"],
+            "changed_ids": json.loads(row["changed_ids"]),
+            "actor": row["actor"],
+            "at": row["at"],
+        }
+
+    @staticmethod
+    def _attempts_of(c: sqlite3.Connection, event_id: str) -> int:
+        r = c.execute("SELECT attempts FROM events WHERE event_id=?", (event_id,)).fetchone()
+        return int(r["attempts"])
 
     # ------------------------------------------------------------- queries
     def history(self, event_id: str) -> list[HistoryItem]:
@@ -397,9 +604,63 @@ class Storage:
                 at=r["at"], from_state=r["from_state"], to_state=EventState(r["to_state"]),
                 attempt=r["attempt"], reason=r["reason"],
                 actor=r["actor"],
+                batch_id=r["batch_id"] if "batch_id" in r.keys() else None,
             )
             for r in rows
         ]
+
+    def list_events(
+        self,
+        *,
+        states: list[str] | None = None,
+        trace_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[EventView]:
+        """按状态（可多值）与/或调用方追踪标识筛选事件。无条件则分页列出全部。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if states:
+            clauses.append("state IN (%s)" % ",".join("?" for _ in states))
+            params.extend(states)
+        if trace_id is not None:
+            clauses.append("correlation_id = ?")
+            params.append(trace_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT * FROM events %s ORDER BY created_at, event_id LIMIT ? OFFSET ?"
+            % where
+        )
+        params.extend([max(1, min(limit, 500)), max(0, offset)])
+        with self._write_lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [self._to_view(r) for r in rows]
+
+    def trace_view(self, trace_id: str) -> dict[str, Any] | None:
+        """按调用方追踪标识反查：关联事件清单、各状态计数与副作用总数。
+
+        标识不存在（无任何事件关联）返回 None。
+        """
+        with self._write_lock:
+            rows = self.conn.execute(
+                "SELECT * FROM events WHERE correlation_id=? ORDER BY created_at, event_id",
+                (trace_id,),
+            ).fetchall()
+            if not rows:
+                return None
+            by_state = {s.value: 0 for s in EventState}
+            side = 0
+            for r in rows:
+                by_state[r["state"]] += 1
+                if r["state"] == EventState.SUCCEEDED.value:
+                    side += 1
+        return {
+            "trace_id": trace_id,
+            "event_count": len(rows),
+            "by_state": by_state,
+            "events": [self._to_view(r) for r in rows],
+            "side_effect_count": side,
+        }
 
     def find_stale_leases(self, stale_before: float) -> list[sqlite3.Row]:
         with self._write_lock:
