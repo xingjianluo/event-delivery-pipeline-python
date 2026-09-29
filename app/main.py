@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -27,7 +28,9 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     async def lifespan(app: FastAPI):
         storage = Storage(settings)
         storage.connect()
-        handler = DownstreamHandler()
+        # hang 演练标记文件与数据库放在同一目录，方便本地/子进程测试同步
+        hang_dir = os.path.dirname(os.path.abspath(settings.db_path))
+        handler = DownstreamHandler(hang_dir=hang_dir)
         retry = RetryPolicy(settings)
         pipeline = Pipeline(storage, handler, retry, settings)
         app.state.settings = settings
@@ -37,7 +40,10 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
 
         worker: Worker | None = None
         if start_worker:
-            worker = Worker(pipeline, storage, settings.poll_interval)
+            worker = Worker(
+                pipeline, storage, settings.poll_interval,
+                concurrency=settings.worker_concurrency,
+            )
             if settings.recovery_on_startup:
                 stale = worker.recover_stale()
                 if stale:

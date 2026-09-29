@@ -13,10 +13,13 @@ from dataclasses import dataclass, fields
 class Settings:
     db_path: str = "./data/events.db"
     lease_timeout: float = 30.0        # PROCESSING 卡住超过该秒数可被重新认领
+    min_lease_grace: float = 0.05      # 即使 lease_timeout 调到 0，一次在途投递
+                                       # 至少受保护的秒数，防止零租约误杀处理中的事件
     max_attempts: int = 3              # 含首次在内的最大尝试次数
     base_backoff: float = 0.05         # 指数退避基数（秒）
     backoff_factor: float = 2.0
     poll_interval: float = 0.05        # 后台轮询间隔（秒）
+    worker_concurrency: int = 2        # 后台并发投递线程数（多实例下各自独立认领）
     recovery_on_startup: bool = True
 
 

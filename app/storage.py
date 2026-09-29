@@ -14,6 +14,10 @@
                           ├─未知错误/重试耗尽─▶ DEAD（终态，可人工处置）
     DEAD/FAILED ─requeue─▶ PENDING（attempts 清零，留痕）
     DEAD/FAILED ─discard─▶ DISCARDED（终态）
+
+崩溃循环收敛：回收超时租约时，若该事件 attempts 已达 max_attempts，不再重新
+投递，直接迁移到 DEAD 终态——因此无论 lease_timeout 多极端，attempts 都不会
+超过上限，事件必然在有限步内落到可查询、可人工处置的终态。
 """
 from __future__ import annotations
 
@@ -31,6 +35,19 @@ from app.models import EventState, EventView, HistoryItem
 log = logging.getLogger("event_pipeline.storage")
 
 _TERMINAL = {EventState.SUCCEEDED, EventState.FAILED, EventState.DEAD, EventState.DISCARDED}
+
+
+class BatchIdempotencyConflict(Exception):
+    """同一 idempotency_key 被用于不同的批量动作（action）。"""
+
+    def __init__(self, key: str, existing_action: str, requested_action: str):
+        super().__init__(
+            f"idempotency_key={key!r} already used with action={existing_action!r}, "
+            f"cannot reuse for {requested_action!r}"
+        )
+        self.key = key
+        self.existing_action = existing_action
+        self.requested_action = requested_action
 
 
 class Storage:
@@ -82,6 +99,7 @@ class Storage:
                     next_attempt_at REAL,
                     lease_owner    TEXT,
                     leased_at      REAL,
+                    reclaim_count  INTEGER NOT NULL DEFAULT 0,
                     last_error     TEXT,
                     failure_kind   TEXT,
                     disposition    TEXT,
@@ -117,6 +135,37 @@ class Storage:
                 )
                 """
             )
+            # 条件查询索引：按追踪标识反查、按状态筛选运维列表
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_correlation "
+                "ON events(correlation_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_state_created "
+                "ON events(state, created_at, event_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_correlation "
+                "ON event_history(correlation_id, id)"
+            )
+            # 批量处置审计表：idempotency_key 唯一，保证同一批重复提交不重复处置
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_ops (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action          TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    result_json     TEXT NOT NULL,
+                    at              REAL NOT NULL
+                )
+                """
+            )
+            # 旧库补列：reclaim_count 记录在途租约被回收的次数
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(events)").fetchall()}
+            if "reclaim_count" not in cols:
+                c.execute(
+                    "ALTER TABLE events ADD COLUMN reclaim_count INTEGER NOT NULL DEFAULT 0"
+                )
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -224,46 +273,103 @@ class Storage:
 
         attempts 在认领时 +1（即投递尝试次数，含首次与崩溃后回收），
         状态迁移到 PROCESSING。返回事件 id；没有可投递事件返回 None。
+
+        收敛保证：回收超时租约时，对已用满投递次数（attempts >=
+        max_attempts，再回收即超额）的在途事件直接落 DEAD 终态并留痕，不再
+        投递。为避免 ``lease_timeout=0`` 时把“正常处理中但尚未写终态”的健康
+        事件误判成超时在途，实际可回收时刻不早于认领后 ``min_lease_grace``
+        秒（默认 50ms，足以完成本地下游调用）。崩溃循环最多产生
+        max_attempts 次投递后必然收敛到可人工处置的终态，attempts 不超上限。
         """
-        stale_before = now - self.settings.lease_timeout
+        stale_before = now - max(
+            self.settings.lease_timeout, self.settings.min_lease_grace
+        )
         with self._tx() as c:
-            row = c.execute(
-                """
-                SELECT event_id, state, attempts FROM events
-                WHERE (state = 'PENDING'
-                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-                   OR (state = 'PROCESSING' AND leased_at IS NOT NULL
-                       AND leased_at <= ?)
-                ORDER BY created_at, event_id
-                LIMIT 1
-                """,
-                (now, stale_before),
-            ).fetchone()
-            if row is None:
-                return None
+            # 先把已用满尝试次数的超时在途事件强制收敛到 DEAD（同一事务内），
+            # 再选下一条可投递事件，避免无限重新认领。
+            while True:
+                row = c.execute(
+                    """
+                    SELECT event_id, state, attempts, last_error, failure_kind,
+                           correlation_id, leased_at, reclaim_count
+                    FROM events
+                    WHERE (state = 'PENDING'
+                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                       OR (state = 'PROCESSING' AND leased_at IS NOT NULL
+                           AND leased_at <= ?)
+                    ORDER BY created_at, event_id
+                    LIMIT 1
+                    """,
+                    (now, stale_before),
+                ).fetchone()
+                if row is None:
+                    return None
+                if EventState(row["state"]) is EventState.PROCESSING \
+                        and row["attempts"] >= self.settings.max_attempts:
+                    self._force_dead_after_stale_attempts(c, row, now, correlation_id)
+                    continue  # 该事件已收敛，选下一条
+                break
+
             event_id = row["event_id"]
             prev = EventState(row["state"])
             new_attempt = row["attempts"] + 1
+            new_reclaims = row["reclaim_count"] + (
+                1 if prev is EventState.PROCESSING else 0
+            )
             c.execute(
                 """UPDATE events
                    SET state='PROCESSING', attempts=?, lease_owner=?, leased_at=?,
-                       next_attempt_at=NULL, updated_at=?
+                       next_attempt_at=NULL, reclaim_count=?, updated_at=?
                    WHERE event_id=?""",
-                (new_attempt, correlation_id, now, now, event_id),
+                (new_attempt, correlation_id, now, new_reclaims, now, event_id),
             )
             reason = "claimed for delivery" if prev is EventState.PENDING \
-                else "reclaimed after stale lease (worker crash/restart)"
+                else f"reclaimed after stale lease (worker crash/restart), " \
+                     f"reclaim_no={new_reclaims}"
             self._history(
-                c, event_id=event_id, correlation_id=self._event_cid(c, event_id),
+                c, event_id=event_id, correlation_id=row["correlation_id"],
                 at=now, from_state=prev.value, to_state=EventState.PROCESSING,
                 attempt=new_attempt, reason=reason, actor=f"worker:{correlation_id}",
             )
             return event_id
 
-    @staticmethod
-    def _event_cid(c: sqlite3.Connection, event_id: str) -> str:
-        r = c.execute("SELECT correlation_id FROM events WHERE event_id=?", (event_id,)).fetchone()
-        return r["correlation_id"]
+    def _force_dead_after_stale_attempts(
+        self,
+        c: sqlite3.Connection,
+        row: sqlite3.Row,
+        now: float,
+        actor_cid: str,
+    ) -> None:
+        """崩溃循环已耗尽尝试次数：PROCESSING -> DEAD（不再投递、attempts 不回退）。
+
+        UPDATE 带 state/attempts/leased_at 守卫并检查 rowcount：并发回收时
+        只有一个线程能落终态并写历史，其他人静默跳过（该事件随后被重新查询
+        时已是 DEAD，不会再进入候选）。
+        """
+        event_id = row["event_id"]
+        attempts = row["attempts"]
+        kind = row["failure_kind"] or "transient"
+        last_error = row["last_error"] or "delivery never completed before lease expired"
+        cur = c.execute(
+            """UPDATE events
+               SET state='DEAD', lease_owner=NULL, leased_at=NULL,
+                   next_attempt_at=NULL, failure_kind=?, last_error=?,
+                   disposition='dead_after_stale_attempts', updated_at=?
+               WHERE event_id=? AND state='PROCESSING' AND attempts=?
+                 AND leased_at=? AND reclaim_count=?""",
+            (kind, last_error, now, event_id, attempts,
+             row["leased_at"], row["reclaim_count"]),
+        )
+        if cur.rowcount == 0:
+            return  # 已被其他回收线程迁移
+        self._history(
+            c, event_id=event_id, correlation_id=row["correlation_id"], at=now,
+            from_state=EventState.PROCESSING.value, to_state=EventState.DEAD,
+            attempt=attempts,
+            reason=f"{kind}: {last_error} (stale lease; attempts {attempts} "
+                   f"exhausted, moved to dead letter instead of reclaiming)",
+            actor=f"worker:{actor_cid}",
+        )
 
     def _claim_still_ours(self, c: sqlite3.Connection, event_id: str, attempt: int) -> sqlite3.Row | None:
         row = c.execute(
@@ -353,7 +459,8 @@ class Storage:
             c.execute(
                 """UPDATE events
                    SET state='PENDING', attempts=0, lease_owner=NULL, leased_at=NULL,
-                       next_attempt_at=NULL, disposition='requeued', updated_at=?
+                       next_attempt_at=NULL, reclaim_count=0,
+                       disposition='requeued', updated_at=?
                    WHERE event_id=?""",
                 (now, event_id),
             )
@@ -385,6 +492,140 @@ class Storage:
             )
             return True
 
+    def batch_dispose(
+        self,
+        *,
+        action: str,
+        idempotency_key: str,
+        event_ids: list[str] | None,
+        states: list[str] | None,
+        correlation_id: str | None,
+        reason: str,
+        actor: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """幂等批量人工处置（requeue/discard）。
+
+        - 整个选择 + 逐行状态迁移 + 审计登记在**单个事务**内完成；
+        - 只处置 DEAD/FAILED：SUCCEEDED/PENDING/PROCESSING/DISCARDED 即使命中
+          选择器也一律进入 skipped，绝不把正常完成的事件卷进去；
+        - 幂等：idempotency_key 唯一，重复提交直接返回首次结果（replayed=true），
+          不重复迁移、不重复写历史、不产生额外副作用；
+        - 每个被处置的事件都单独写一行 event_history（含 batch 与操作者）。
+        """
+        if action not in {"requeue", "discard"}:
+            raise ValueError("action must be 'requeue' or 'discard'")
+        ids_filter = list(dict.fromkeys(event_ids)) if event_ids else None
+        disposable = (EventState.DEAD.value, EventState.FAILED.value)
+
+        with self._tx() as c:
+            existing = c.execute(
+                "SELECT id, action, result_json FROM batch_ops WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["action"] != action:
+                    raise BatchIdempotencyConflict(
+                        idempotency_key, existing["action"], action
+                    )
+                result = json.loads(existing["result_json"])
+                result["replayed"] = True
+                return result
+
+            # 1) 显式 id 中不存在的（不受其他筛选条件影响）
+            not_found: list[str] = []
+            if ids_filter:
+                placeholders = ",".join("?" for _ in ids_filter)
+                found = {
+                    r["event_id"] for r in c.execute(
+                        f"SELECT event_id FROM events WHERE event_id IN ({placeholders})",
+                        ids_filter,
+                    ).fetchall()
+                }
+                not_found = [eid for eid in ids_filter if eid not in found]
+
+            # 2) 命中选择器的候选行
+            clauses: list[str] = []
+            params: list[Any] = []
+            if ids_filter:
+                clauses.append(f"event_id IN ({','.join('?' for _ in ids_filter)})")
+                params.extend(ids_filter)
+            if states:
+                clauses.append(f"state IN ({','.join('?' for _ in states)})")
+                params.extend(states)
+            if correlation_id is not None:
+                clauses.append("correlation_id = ?")
+                params.append(correlation_id)
+            if not clauses:
+                raise ValueError("empty selector is not allowed for batch disposal")
+            rows = c.execute(
+                f"SELECT * FROM events WHERE {' AND '.join(clauses)} "
+                "ORDER BY created_at, event_id",
+                params,
+            ).fetchall()
+
+            changed: list[str] = []
+            skipped: list[str] = []
+            cur = c.execute(
+                "INSERT INTO batch_ops(action, idempotency_key, result_json, at) "
+                "VALUES (?,?,?,?)",
+                (action, idempotency_key, "{}", now),
+            )
+            batch_id = int(cur.lastrowid)
+
+            for row in rows:
+                eid = row["event_id"]
+                if row["state"] not in disposable:
+                    skipped.append(eid)
+                    continue
+                if action == "requeue":
+                    c.execute(
+                        """UPDATE events
+                           SET state='PENDING', attempts=0, lease_owner=NULL,
+                               leased_at=NULL, next_attempt_at=NULL, reclaim_count=0,
+                               disposition='requeued', updated_at=?
+                           WHERE event_id=?""",
+                        (now, eid),
+                    )
+                    self._history(
+                        c, event_id=eid, correlation_id=row["correlation_id"], at=now,
+                        from_state=row["state"], to_state=EventState.PENDING, attempt=0,
+                        reason=f"batch#{batch_id} requeue: {reason}",
+                        actor=f"batch#{batch_id}:{actor}",
+                    )
+                else:
+                    c.execute(
+                        "UPDATE events SET state='DISCARDED', disposition='discarded', "
+                        "updated_at=? WHERE event_id=?",
+                        (now, eid),
+                    )
+                    self._history(
+                        c, event_id=eid, correlation_id=row["correlation_id"], at=now,
+                        from_state=row["state"], to_state=EventState.DISCARDED,
+                        attempt=row["attempts"],
+                        reason=f"batch#{batch_id} discard: {reason}",
+                        actor=f"batch#{batch_id}:{actor}",
+                    )
+                changed.append(eid)
+
+            result = {
+                "batch_id": batch_id,
+                "action": action,
+                "idempotency_key": idempotency_key,
+                "changed": changed,
+                "skipped": skipped,
+                "not_found": not_found,
+                "changed_count": len(changed),
+                "skipped_count": len(skipped),
+                "replayed": False,
+                "at": now,
+            }
+            c.execute(
+                "UPDATE batch_ops SET result_json=? WHERE id=?",
+                (json.dumps(result, ensure_ascii=False, sort_keys=True), batch_id),
+            )
+            return result
+
     # ------------------------------------------------------------- queries
     def history(self, event_id: str) -> list[HistoryItem]:
         with self._write_lock:
@@ -400,6 +641,54 @@ class Storage:
             )
             for r in rows
         ]
+
+    def history_by_correlation(self, correlation_id: str) -> list[HistoryItem]:
+        """按调用方追踪标识反查其关联的全部流转记录（跨事件、按时间顺序）。"""
+        with self._write_lock:
+            rows = self.conn.execute(
+                "SELECT * FROM event_history WHERE correlation_id=? ORDER BY id",
+                (correlation_id,),
+            ).fetchall()
+        return [
+            HistoryItem(
+                id=r["id"], event_id=r["event_id"], correlation_id=r["correlation_id"],
+                at=r["at"], from_state=r["from_state"], to_state=EventState(r["to_state"]),
+                attempt=r["attempt"], reason=r["reason"],
+                actor=r["actor"],
+            )
+            for r in rows
+        ]
+
+    def find_events(
+        self,
+        *,
+        states: list[str] | None = None,
+        correlation_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[EventView]:
+        """按条件筛选事件：状态（可多个）、追踪标识、事件类型；稳定排序。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if states:
+            clauses.append(f"state IN ({','.join('?' for _ in states)})")
+            params.extend(states)
+        if correlation_id is not None:
+            clauses.append("correlation_id = ?")
+            params.append(correlation_id)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.extend([max(1, min(limit, 500)), max(0, offset)])
+        with self._write_lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM events {where} "
+                "ORDER BY created_at, event_id LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return [self._to_view(r) for r in rows]
 
     def find_stale_leases(self, stale_before: float) -> list[sqlite3.Row]:
         with self._write_lock:

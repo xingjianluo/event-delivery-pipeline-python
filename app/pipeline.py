@@ -12,7 +12,11 @@ from app.errors import classify, FailureKind
 from app.models import AcceptResult
 from app.retry import RetryPolicy
 from app.storage import Storage
-from app.tracing import new_correlation_id, use_correlation_id
+from app.tracing import (
+    resolve_correlation_id,
+    use_correlation_id,
+    validate_correlation_id,
+)
 
 log = logging.getLogger("event_pipeline.pipeline")
 
@@ -57,11 +61,21 @@ class Pipeline:
         event_type: str,
         payload: dict,
         now: float | None = None,
+        correlation_id: str | None = None,
     ) -> AcceptResult:
+        """接收一个事件。
+
+        ``correlation_id`` 为调用方自带追踪标识：
+        - 首次提交：校验后原样作为该事件的关联标识持久化（不提供则服务端生成）；
+        - 重复提交：**沿用首次持久化的标识**，绝不被本次提交悄悄替换；若本次
+          带了不同的值，在响应中以 ``correlation_id_mismatch`` 明确告知，同时
+          回显本次提交值与首次值，让调用方能够对得上账。
+        """
         now = time.time() if now is None else now
+        submitted = validate_correlation_id(correlation_id)
         chash = content_hash(event_type, payload)
-        # 重复提交沿用首次提交的关联标识（持久化在事件行上），不产生新处理
-        cid = new_correlation_id()
+        # 首次写入使用调用方标识（缺省时生成）；重复提交沿用行上的既有标识
+        cid = resolve_correlation_id(submitted)
         created, conflict = self.storage.insert_event_if_absent(
             event_id, event_type, payload, chash, cid, now
         )
@@ -73,13 +87,16 @@ class Pipeline:
             raise ContentConflict(event_id, conflict, chash)
         view = self.storage.get_event(event_id)
         assert view is not None
+        mismatch = bool(submitted is not None and submitted != view.correlation_id)
         log.info(
-            "receive event_id=%s cid=%s duplicate=%s state=%s",
-            event_id, view.correlation_id, not created, view.state.value,
+            "receive event_id=%s cid=%s submitted_cid=%s duplicate=%s mismatch=%s state=%s",
+            event_id, view.correlation_id, submitted, not created, mismatch, view.state.value,
         )
         return AcceptResult(
             event_id=event_id, state=view.state, duplicate=not created,
             correlation_id=view.correlation_id,
+            submitted_correlation_id=submitted if mismatch else None,
+            correlation_id_mismatch=mismatch,
         )
 
     # -------------------------------------------------------------- delivery
