@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import logging
 
-from app.config import Settings
-from app.downstream import DownstreamHandler
 from app.models import EventState
 from app.pipeline import Pipeline
 from app.retry import RetryPolicy

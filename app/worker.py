@@ -62,7 +62,7 @@ class Worker:
             log.info("worker %s claimed event_id=%s", self.worker_id, event_id)
             try:
                 self.pipeline.process_once(event_id, cid, now=now)
-            except Exception:  # noqa: BLE001 - 兜底：worker 循环不能因单条事件退出
+            except Exception:
                 log.exception("worker loop error on event_id=%s", event_id)
         log.info("worker %s stopped", self.worker_id)
 

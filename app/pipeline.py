@@ -8,7 +8,7 @@ import time
 
 from app.config import Settings
 from app.downstream import DownstreamHandler
-from app.errors import classify, FailureKind
+from app.errors import FailureKind, classify
 from app.models import AcceptResult
 from app.retry import RetryPolicy
 from app.storage import Storage

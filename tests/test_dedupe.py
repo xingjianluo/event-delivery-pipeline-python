@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from concurrent.futures import ThreadPoolExecutor
 
 from app.models import EventState
 from app.tracing import new_correlation_id

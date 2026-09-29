@@ -150,3 +150,53 @@ def test_batch_endpoints_filter_and_validation(settings, storage, pipeline, cloc
         assert {e["event_id"] for e in listed} == {"t-a", "t-b"}
         by_trace = c.get("/events", params={"trace_id": "trace-x"}).json()
         assert len(by_trace) == 3
+
+
+def test_batch_concurrent_with_worker_and_resubmit(settings, storage, pipeline):
+    """批量 discard 与后台投递/重复提交并发：不重复副作用、不报错、终态稳定。"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    pipeline.receive("bc", "t", {"simulate": {"mode": "unknown"}}, trace_id="tr-bc")
+
+    def worker_rounds():
+        import time as _t
+        end = _t.time() + 3
+        while _t.time() < end:
+            cid = new_correlation_id()
+            eid = storage.claim_next(_t.time(), cid)
+            if eid:
+                pipeline.process_once(eid, cid)
+            else:
+                _t.sleep(0.002)
+
+    t = threading.Thread(target=worker_rounds, daemon=True)
+    t.start()
+    # 同时反复重复提交（同内容）+ 反复批量 discard
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = []
+        for _ in range(20):
+            futs.append(pool.submit(
+                lambda: pipeline.receive("bc", "t",
+                                         {"simulate": {"mode": "unknown"}},
+                                         trace_id="tr-bc")))
+        for _ in range(20):
+            futs.append(pool.submit(lambda: storage.batch_dispose(
+                action="discard", event_ids=["bc"], correlation_id="ops",
+                batch_id=new_correlation_id().replace("cid_", "batch_"),
+                selector="ids", dry_run=False, now=0.0)))
+        [f.result() for f in futs]
+    t.join(timeout=5)
+
+    v = storage.get_event("bc")
+    # 终态必为 DEAD（无批量）或 DISCARDED（某个批量先到），绝不可能回到在途/成功
+    assert v.state in (EventState.DEAD, EventState.DISCARDED)
+    assert v.trace_id == "tr-bc"
+    assert storage.side_effect_count("bc") == 0, "失败事件在任何并发交叉下都不产生副作用"
+    # 成功路径事件在并发下也只产生一次副作用
+    pipeline.receive("ok", "t", {}, trace_id="tr-ok")
+    cid = new_correlation_id()
+    eid = storage.claim_next(100.0, cid)
+    assert eid == "ok"
+    pipeline.process_once("ok", cid, now=100.0)
+    assert storage.side_effect_count("ok") == 1

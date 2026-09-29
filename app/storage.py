@@ -22,8 +22,9 @@ import logging
 import os
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 from app.config import Settings
 from app.models import EventState, EventView, HistoryItem
@@ -608,7 +609,8 @@ class Storage:
                 at=r["at"], from_state=r["from_state"], to_state=EventState(r["to_state"]),
                 attempt=r["attempt"], reason=r["reason"],
                 actor=r["actor"],
-                batch_id=r["batch_id"] if "batch_id" in r.keys() else None,
+                # batch_id 列由 connect() 中的轻量迁移保证存在
+                batch_id=r["batch_id"],
             )
             for r in rows
         ]
@@ -625,16 +627,14 @@ class Storage:
         clauses: list[str] = []
         params: list[Any] = []
         if states:
-            clauses.append("state IN (%s)" % ",".join("?" for _ in states))
+            placeholders = ",".join("?" for _ in states)  # 仅拼接占位符，值走参数绑定
+            clauses.append(f"state IN ({placeholders})")
             params.extend(states)
         if trace_id is not None:
             clauses.append("correlation_id = ?")
             params.append(trace_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = (
-            "SELECT * FROM events %s ORDER BY created_at, event_id LIMIT ? OFFSET ?"
-            % where
-        )
+        sql = f"SELECT * FROM events {where} ORDER BY created_at, event_id LIMIT ? OFFSET ?"
         params.extend([max(1, min(limit, 500)), max(0, offset)])
         with self._write_lock:
             rows = self.conn.execute(sql, params).fetchall()
