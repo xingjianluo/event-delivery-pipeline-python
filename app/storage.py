@@ -263,11 +263,12 @@ class Storage:
         attempts 在认领时 +1（即投递尝试次数，含首次与崩溃后回收），
         状态迁移到 PROCESSING。返回事件 id；没有可投递事件返回 None。
 
-        崩溃循环收敛保证：回收一个超时租约时，若该事件的尝试次数已经达到
-        ``max_attempts``（例如 lease_timeout 被调到 0、worker 每轮都在写终态前
-        崩溃），则**不再重新认领**，而是直接把它隔离到 DEAD 终态（可查询、可人工
-        requeue）。这样在任何极端参数下，单条事件的认领次数都不会超过上限，
-        既不会无限重认领，也不会发生状态回退（PROCESSING -> DEAD 只进不退）。
+        崩溃循环收敛保证：回收一个超时租约时，若该事件**已用尽全部尝试次数**
+        （当前 attempts >= max_attempts，即最后一次投递尝试也是以崩溃/超时告终），
+        则**不再重新认领**，而是直接把它隔离到 DEAD 终态（可查询、可人工 requeue）。
+        这样在任何极端参数下，单条事件的认领次数都不会超过上限，既不会无限重认领，
+        也不会发生状态回退（PROCESSING -> DEAD 只进不退）；最后一次尝试机会仍会被
+        真正执行（它完全可能成功），不会因为前序崩溃就被提前剥夺。
 
         本事务内的扫描循环必然终止：每跳过一条都是把一条陈旧的 PROCESSING 行
         原子迁移为 DEAD（该行此后不再匹配候选查询），库内行数有限。
@@ -292,15 +293,18 @@ class Storage:
                     return None
                 event_id = row["event_id"]
                 prev = EventState(row["state"])
-                new_attempt = row["attempts"] + 1
+                stored_attempts = row["attempts"]
+                new_attempt = stored_attempts + 1
                 if (
                     prev is EventState.PROCESSING
-                    and new_attempt >= max_attempts
+                    and stored_attempts >= max_attempts
                 ):
-                    # 崩溃/回收循环已用尽尝试次数：隔离到 DEAD，等待人工研判
+                    # 最后一次投递尝试也以崩溃/租约超时告终：隔离到 DEAD，等待人工研判。
+                    # attempts 不再自增，精确停在 max_attempts（与“重试耗尽”口径一致）。
                     msg = (
-                        f"stale lease quarantined: attempt {new_attempt} reached "
-                        f"max_attempts={max_attempts} (worker crash/restart loop)"
+                        f"stale lease quarantined: last delivery attempt "
+                        f"{stored_attempts}/{max_attempts} ended with worker "
+                        f"crash/restart (no retry budget left)"
                     )
                     c.execute(
                         """UPDATE events
@@ -314,8 +318,8 @@ class Storage:
                         c, event_id=event_id,
                         correlation_id=self._event_cid(c, event_id), at=now,
                         from_state=EventState.PROCESSING.value, to_state=EventState.DEAD,
-                        attempt=new_attempt,
-                        reason="reclaimed stale lease but attempts exhausted; "
+                        attempt=stored_attempts,
+                        reason="stale lease after final attempt crashed; "
                                "quarantined for manual review",
                         actor=f"worker:{correlation_id}",
                     )

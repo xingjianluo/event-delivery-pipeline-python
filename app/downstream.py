@@ -37,8 +37,13 @@ class DownstreamHandler:
             reason = sim.get("reason", "unclassifiable failure") if isinstance(sim, dict) else "unclassifiable failure"
             raise UnknownFailure(reason)
         if mode == "slow":
-            delay = float(sim.get("delay", 1.0)) if isinstance(sim, dict) else 1.0
+            simd = sim if isinstance(sim, dict) else {}
+            delay = float(simd.get("delay", 1.0))
+            then = simd.get("then", "succeed")
             time.sleep(max(0.0, delay))
+            if then == "crash_fail":
+                # 模拟“慢处理之后仍失败”（供测试）；默认睡完即走成功路径
+                raise TransientError(f"slow handler failed after {delay}s")
             # 睡眠结束后落到下面的成功路径
 
         with self._lock:
