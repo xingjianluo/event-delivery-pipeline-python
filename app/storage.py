@@ -623,7 +623,14 @@ class Storage:
         limit: int = 100,
         offset: int = 0,
     ) -> list[EventView]:
-        """按状态（可多值）与/或调用方追踪标识筛选事件。无条件则分页列出全部。"""
+        """按状态（可多值）与/或调用方追踪标识筛选事件。无条件则分页列出全部。
+
+        ``states=[]``（显式空集合）表示“按状态筛选，但没有任何状态被允许”，
+        必须 fail-closed 直接返回空，绝不能解释为“无状态约束”而列出全量——
+        批量处置等调用方依赖这一点保证非法筛选不会漏成全库操作。
+        """
+        if states is not None and not states:
+            return []
         clauses: list[str] = []
         params: list[Any] = []
         if states:

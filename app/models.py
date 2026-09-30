@@ -85,6 +85,8 @@ class BatchActionRequest(BaseModel):
 
 
 class BatchFilter(BaseModel):
+    # 显式给值时只取与可处置状态（DEAD/FAILED）的交集；交集为空则一个都不命中，
+    # 不会退化为全量。None = 不按状态约束；[] = 空集合（同样零命中，fail-closed）。
     state: list[EventState] | None = None
     trace_id: str | None = None
 

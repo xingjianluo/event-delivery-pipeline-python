@@ -107,17 +107,24 @@ def batch_action(body: BatchActionRequest, request: Request) -> BatchActionResul
     """批量人工处置（requeue/discard）。
 
     - 只处置 DEAD/FAILED；SUCCEEDED/PENDING/PROCESSING/DISCARDED 进入 skipped_terminal；
+    - **fail-closed 圈选**：filter.state 显式给值时，只取其与 {DEAD,FAILED} 的交集；
+      交集为空（例如只给 SUCCEEDED）就当“圈不到任何可处置事件”，一个都不选、
+      绝不会退化为全库扫描波及无关死信；state=[]（空列表）同样按空集合处理；
     - 幂等：重复执行第二次 changed 为空，不产生新的状态迁移与副作用；
-    - 非 dry-run 在 manual_batches 留审计，历史迁移带 batch_id；
+    - 非 dry-run 在 manual_batches 留审计（0 命中时 changed_count=0，绝不虚报条数），
+      历史迁移带 batch_id；
     - 可用 event_ids 显式指定，或用 filter（state/trace_id）圈定，二者至少给一个。
     """
     storage = request.app.state.storage
     actor_cid = _request_cid(request)
 
     explicit_ids = body.event_ids or []
+    # None 表示 filter 未给 state 约束（可在 DEAD/FAILED 全量圈定）；
+    # set（含空集）表示调用方显式给了 state 列表——空交集必须按“圈不到”处理，
+    # 绝不允许退化为无状态约束的全量扫描（fail-closed）。
     filter_states: set[str] | None = None
     filter_trace = body.filter.trace_id if body.filter else None
-    if body.filter and body.filter.state:
+    if body.filter and body.filter.state is not None:
         filter_states = {s.value for s in body.filter.state}
 
     if not explicit_ids and filter_states is None and filter_trace is None:
@@ -132,13 +139,16 @@ def batch_action(body: BatchActionRequest, request: Request) -> BatchActionResul
     selected: list[str] = list(dict.fromkeys(explicit_ids))
     if filter_states is not None or filter_trace is not None:
         allowed = {s.value for s in _DISPOSABLE_STATES}
-        wanted = (filter_states or allowed) & allowed
-        views = storage.list_events(
-            states=sorted(wanted), trace_id=filter_trace, limit=500
-        )
-        for v in views:
-            if v.event_id not in selected:
-                selected.append(v.event_id)
+        wanted = allowed if filter_states is None else filter_states & allowed
+        # 显式 state 与可处置状态没有交集（例如只给了 SUCCEEDED）：
+        # 条件本身圈不出任何可处置事件，直接空集合，一个都不查/不选。
+        if wanted:
+            views = storage.list_events(
+                states=sorted(wanted), trace_id=filter_trace, limit=500
+            )
+            for v in views:
+                if v.event_id not in selected:
+                    selected.append(v.event_id)
 
     batch_id = new_batch_id()
     selector = json.dumps(

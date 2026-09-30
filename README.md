@@ -84,8 +84,17 @@ curl -s localhost:8000/traces/biz-order-42
 - **只处置 `DEAD/FAILED`**：`SUCCEEDED/PENDING/PROCESSING/DISCARDED` 一律进入
   `skipped_terminal`，已正常完成的事件绝不会被卷入，因此不可能产生第二次副作用；
   即使 `filter.state` 里写了 `SUCCEEDED`，也会被收敛到可处置集合；
+- **圈不到就一个都不动（fail-closed，绝不漏成全量）**：`filter.state` 显式给值时，
+  只取它与 `{DEAD, FAILED}` 的交集；交集为空——例如只传 `["SUCCEEDED"]`（或
+  `PENDING/PROCESSING/DISCARDED` 等任何不可人工处置的组合）、空列表 `[]`，或
+  `state` 与 `trace_id` 组合后没有交集——本次请求的候选集合就是空：**不会改动任何
+  事件**，也不会波及追踪标识不同、与筛选完全无关的死信/失败事件，不产生任何状态
+  迁移历史与副作用；响应 `matched=0, changed=[]`。非 dry-run 时审计行如实记录
+  `matched=0, changed_count=0, changed_ids=[]`（可查但绝不虚报条数），dry-run 不落
+  审计；
 - **幂等**：圈选与迁移在同一个 `BEGIN IMMEDIATE` 事务内完成；重复执行第二次
-  `changed` 为空，不产生新的状态迁移与副作用；
+  `changed` 为空，不产生新的状态迁移与副作用；多实例 / 后台投递并发交叉、或重复
+  提交同一个批量请求时，上述边界同样成立；
 - **可审计**：非 `dry_run` 在 `manual_batches` 落一行，每条历史迁移带 `batch_id`，
   可用 `GET /batch-actions/{batch_id}` 回查；`dry_run` 只预演不落库、不改状态。
 
@@ -188,9 +197,28 @@ attempts 与副作用计数不回退、不重复。多个服务进程同时打�
 
 ```bash
 uv run pytest -q -s          # 测试日志打印 event_id、追踪标识与每次状态流转依据
+
+# 只跑本次 fail-closed 边界（圈不到可处置事件的各种写法）
+uv run pytest tests/test_batch_empty_match.py -q
 ```
 
-测试覆盖（`tests/`，共 37 个）：
+手工复现/验证“只带不可处置状态的批量丢弃不会波及无关死信”：
+
+```bash
+uv run uvicorn app.main:app --port 8000 &
+# 造一个一定会进 DEAD 的事件（unknown 失败，追踪标识 trace-victim）
+curl -s -X POST localhost:8000/events -H 'content-type: application/json' \
+  -d '{"event_id":"victim","event_type":"t","payload":{"simulate":{"mode":"unknown"}},"trace_id":"trace-victim"}'
+sleep 1  # 等后台投递把它送到 DEAD
+# 只按 SUCCEEDED 圈选批量丢弃 —— 修复前会把 victim 误丢，修复后必须 matched=0
+curl -s -X POST localhost:8000/events/batch -H 'content-type: application/json' \
+  -d '{"action":"discard","filter":{"state":["SUCCEEDED"]}}'
+# 期望：{"matched":0,"changed":[] ...}；victim 仍是 DEAD，且没有 DISCARDED 历史
+curl -s localhost:8000/events/victim | python -c 'import sys,json;print(json.load(sys.stdin)["state"])'
+curl -s localhost:8000/events/victim/history
+```
+
+测试覆盖（`tests/`，共 52 个）：
 
 1. **并发重复提交**（`test_dedupe.py`、`test_concurrency.py`）：20 线程并发提交同一事件、
    40 事件 × 3 次重复 + 3 个 worker 并发投递；断言仅一次首次处理、每个事件副作用恰好 1 次；
@@ -208,6 +236,13 @@ uv run pytest -q -s          # 测试日志打印 event_id、追踪标识与每�
 6. **按条件筛选 + 批量处置**（`test_batch.py`）：只动 DEAD/FAILED、成功/在途事件不卷入、
    幂等无重复迁移与副作用、审计落库且历史带 batch_id、dry-run 不改状态、按 state/trace 圈选、
    空选择器 400，以及批量与 worker/重复提交并发的压测；
+   - **圈不到可处置事件时 fail-closed**（`test_batch_empty_match.py`）：参数化覆盖
+     `state` 只给 `SUCCEEDED/PENDING/PROCESSING/DISCARDED` 及其组合、空状态列表、
+     `state`+`trace_id` 无交集、不存在的 trace 等写法，断言所有事件状态与历史条数不变、
+     无副作用、审计如实为 0；并复现“只圈 SUCCEEDED 却丢掉无关 trace 死信”的事故场景
+     断言受害者保持 DEAD；另含 dry-run 不写审计、同一批量请求重复提交零额外迁移、
+     与后台投递并发 40 次重复提交死信仍保持 DEAD、以及 `list_events(states=[])`
+     fail-closed 的底层防护；
 7. **极端参数收敛**（`test_convergence.py`）：`max_attempts=1` 立即死信、`lease_timeout=0`
    崩溃循环被上限隔离到 DEAD、attempts 围栏拒绝迟到结果防状态回退、非法配置启动即失败；
 8. **HTTP 语义**（`test_api.py`）：201/200/409 可区分、历史可查、人工处置与非法迁移拒绝。
