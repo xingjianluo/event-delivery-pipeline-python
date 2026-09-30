@@ -623,10 +623,18 @@ class Storage:
         limit: int = 100,
         offset: int = 0,
     ) -> list[EventView]:
-        """按状态（可多值）与/或调用方追踪标识筛选事件。无条件则分页列出全部。"""
+        """按状态（可多值）与/或调用方追踪标识筛选事件。无条件则分页列出全部。
+
+        注意区分 ``states=None``（未给状态条件）与 ``states=[]``（给了但为空集）：
+        后者是一个**不可能命中**的条件，必须返回空集，绝不能退化成"无状态过滤"
+        的全表扫描——否则上层把筛选收敛到空集（例如只圈定不可处置状态）时，
+        会错误地波及库中所有事件。
+        """
         clauses: list[str] = []
         params: list[Any] = []
-        if states:
+        if states is not None:
+            if not states:
+                return []  # 空集合筛选：显式的"什么都不圈"，而非无条件
             placeholders = ",".join("?" for _ in states)  # 仅拼接占位符，值走参数绑定
             clauses.append(f"state IN ({placeholders})")
             params.extend(states)

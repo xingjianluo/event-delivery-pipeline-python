@@ -115,12 +115,17 @@ def batch_action(body: BatchActionRequest, request: Request) -> BatchActionResul
     actor_cid = _request_cid(request)
 
     explicit_ids = body.event_ids or []
-    filter_states: set[str] | None = None
-    filter_trace = body.filter.trace_id if body.filter else None
-    if body.filter and body.filter.state:
-        filter_states = {s.value for s in body.filter.state}
+    flt = body.filter
+    # 区分三种情况：未给 filter.state（None，不施加状态约束）、给了空列表（[]，
+    # 显式空集，什么都圈不到）、给了具体状态。
+    state_values: list[str] | None = (
+        [s.value for s in flt.state]
+        if flt is not None and flt.state is not None
+        else None
+    )
+    filter_trace = flt.trace_id if flt is not None else None
 
-    if not explicit_ids and filter_states is None and filter_trace is None:
+    if not explicit_ids and state_values is None and filter_trace is None:
         raise HTTPException(
             status_code=400,
             detail={
@@ -130,9 +135,12 @@ def batch_action(body: BatchActionRequest, request: Request) -> BatchActionResul
         )
 
     selected: list[str] = list(dict.fromkeys(explicit_ids))
-    if filter_states is not None or filter_trace is not None:
+    if state_values is not None or filter_trace is not None:
         allowed = {s.value for s in _DISPOSABLE_STATES}
-        wanted = (filter_states or allowed) & allowed
+        # 把筛选**收敛**到可处置集合：只给了不可处置状态（如 ["SUCCEEDED"]）时
+        # wanted 为空集。空集必须原样下推为"圈不到任何事件"，绝不能退化为不带
+        # 状态条件的全表查询，否则库里无关的死信/失败事件会被错误卷入。
+        wanted = allowed if state_values is None else set(state_values) & allowed
         views = storage.list_events(
             states=sorted(wanted), trace_id=filter_trace, limit=500
         )

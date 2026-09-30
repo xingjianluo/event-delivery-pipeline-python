@@ -200,3 +200,257 @@ def test_batch_concurrent_with_worker_and_resubmit(settings, storage, pipeline):
     assert eid == "ok"
     pipeline.process_once("ok", cid, now=100.0)
     assert storage.side_effect_count("ok") == 1
+
+
+def _snapshot(storage):
+    """记录全部事件的状态/updated_at 与全局历史行数、副作用总数，用于断言零改动。"""
+    return {
+        e.event_id: (e.state, e.updated_at)
+        for e in storage.list_events(limit=500)
+    }
+
+
+def _history_total(storage) -> int:
+    with storage._write_lock:
+        return storage.conn.execute("SELECT COUNT(*) AS n FROM event_history").fetchone()["n"]
+
+
+def _seed_mixed_terminal_states(storage, pipeline, clock):
+    """构造一个各状态混杂的库：成功、业务失败、死信、在途(PENDING)各一条，trace 分离。"""
+    pipeline.receive("ok", "t", {}, now=clock.now(), trace_id="trace-ok")
+    pipeline.receive("biz", "t", {"simulate": {"mode": "business"}},
+                     now=clock.now(), trace_id="trace-dead")
+    pipeline.receive("unk", "t", {"simulate": {"mode": "unknown"}},
+                     now=clock.now(), trace_id="trace-dead")
+    _drive_to_terminal(storage, pipeline, clock)
+    pipeline.receive("pending", "t", {}, now=clock.now(), trace_id="trace-fly")
+    assert storage.get_event("ok").state is EventState.SUCCEEDED
+    assert storage.get_event("biz").state is EventState.FAILED
+    assert storage.get_event("unk").state is EventState.DEAD
+    assert storage.get_event("pending").state is EventState.PENDING
+    return ["ok", "biz", "unk", "pending"]
+
+
+def _assert_totally_untouched(storage, before_states, before_hist, ids):
+    """零命中批次的核心断言：状态/updated_at/历史行数/副作用全部不变。"""
+    after_states = _snapshot(storage)
+    assert after_states == before_states, "零命中筛选不得改动任何事件（含 updated_at）"
+    assert _history_total(storage) == before_hist, "零命中筛选不得写任何状态迁移历史"
+    # 死信/失败仍在原处，没有被误改成 DISCARDED
+    assert storage.get_event("unk").state is EventState.DEAD
+    assert storage.get_event("biz").state is EventState.FAILED
+    assert storage.get_event("ok").state is EventState.SUCCEEDED
+    assert storage.get_event("pending").state is EventState.PENDING
+    assert storage.side_effect_count("ok") == 1
+    for eid in ids:
+        assert [h for h in storage.history(eid) if h.batch_id is not None] == [], \
+            "零命中批次不得给任何事件挂 batch_id 迁移记录"
+
+
+def test_filter_with_only_non_disposable_state_matches_nothing(
+        settings, storage, pipeline, clock):
+    """回归：filter.state 只给不可处置状态（如 SUCCEEDED）时，绝不能退化为全表处置。
+
+    这是线上踩坑场景：只带 SUCCEEDED 的批量丢弃曾把库中无关死信/失败事件真丢掉。
+    """
+    ids = _seed_mixed_terminal_states(storage, pipeline, clock)
+    before_states, before_hist = _snapshot(storage), _history_total(storage)
+
+    with TestClient(create_app(settings, start_worker=False)) as c:
+        r = c.post("/events/batch",
+                   json={"action": "discard", "filter": {"state": ["SUCCEEDED"]}})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["matched"] == 0 and body["changed"] == []
+        assert body["skipped_terminal"] == [] and body["not_found"] == []
+
+    _assert_totally_untouched(storage, before_states, before_hist, ids)
+
+    # 审计行即便写入，也必须如实记录 changed_count=0（不允许"改了 N 条"的假审计）
+    audit = storage.get_batch(body["batch_id"])
+    assert audit is not None and audit["changed_count"] == 0
+    assert audit["changed_ids"] == [] and audit["matched"] == 0
+
+    # 其它不可处置状态同样安全（PENDING/PROCESSING/DISCARDED，单值与多值）
+    for states in (["PENDING"], ["PROCESSING"], ["DISCARDED"],
+                   ["SUCCEEDED", "PENDING", "PROCESSING", "DISCARDED"]):
+        before_hist2 = _history_total(storage)
+        with TestClient(create_app(settings, start_worker=False)) as c:
+            rr = c.post("/events/batch",
+                        json={"action": "discard", "filter": {"state": states}})
+            assert rr.status_code == 200
+            assert rr.json()["matched"] == 0 and rr.json()["changed"] == []
+        assert _history_total(storage) == before_hist2
+        assert storage.get_event("unk").state is EventState.DEAD
+        assert storage.get_event("biz").state is EventState.FAILED
+
+
+def test_filter_state_and_trace_without_intersection_matches_nothing(
+        settings, storage, pipeline, clock):
+    """state（可处置）与 trace_id 组合后没有交集：一个都不能动。"""
+    ids = _seed_mixed_terminal_states(storage, pipeline, clock)
+    before_states, before_hist = _snapshot(storage), _history_total(storage)
+
+    with TestClient(create_app(settings, start_worker=False)) as c:
+        # 可处置状态存在，但它们属于 trace-dead；拿成功事件的 trace 去圈 -> 空交集
+        r = c.post("/events/batch", json={
+            "action": "discard",
+            "filter": {"state": ["DEAD", "FAILED"], "trace_id": "trace-ok"},
+        })
+        assert r.status_code == 200
+        assert r.json()["matched"] == 0 and r.json()["changed"] == []
+        _assert_totally_untouched(storage, before_states, before_hist, ids)
+
+        # 不存在的 trace_id
+        before_states2, before_hist2 = _snapshot(storage), _history_total(storage)
+        r2 = c.post("/events/batch", json={
+            "action": "discard",
+            "filter": {"state": ["DEAD", "FAILED"], "trace_id": "no-such-trace"},
+        })
+        assert r2.json()["matched"] == 0 and r2.json()["changed"] == []
+        _assert_totally_untouched(storage, before_states2, before_hist2, ids)
+
+        # 不可处置状态 + 无关 trace（两边都空）
+        r3 = c.post("/events/batch", json={
+            "action": "discard",
+            "filter": {"state": ["SUCCEEDED"], "trace_id": "trace-dead"},
+        })
+        assert r3.json()["matched"] == 0 and r3.json()["changed"] == []
+        assert _snapshot(storage) == before_states
+
+
+def test_empty_state_list_is_explicit_empty_match(settings, storage, pipeline, clock):
+    """filter.state=[] 是显式空集（什么都圈不到），不是"无状态条件"。"""
+    ids = _seed_mixed_terminal_states(storage, pipeline, clock)
+    before_states, before_hist = _snapshot(storage), _history_total(storage)
+
+    with TestClient(create_app(settings, start_worker=False)) as c:
+        r = c.post("/events/batch",
+                   json={"action": "discard", "filter": {"state": []}})
+        assert r.status_code == 200
+        assert r.json()["matched"] == 0 and r.json()["changed"] == []
+        # 空 state + trace 同样是空集（trace 无法把空状态集合"救活"）
+        r2 = c.post("/events/batch", json={
+            "action": "discard",
+            "filter": {"state": [], "trace_id": "trace-dead"},
+        })
+        assert r2.json()["matched"] == 0 and r2.json()["changed"] == []
+    _assert_totally_untouched(storage, before_states, before_hist, ids)
+
+
+def test_zero_match_filter_repeated_is_side_effect_free(
+        settings, storage, pipeline, clock):
+    """重复提交同一个零命中批量请求：每次都 0 改动，不累积任何迁移/审计假数据。"""
+    ids = _seed_mixed_terminal_states(storage, pipeline, clock)
+    before_states = _snapshot(storage)
+
+    payload = {"action": "requeue", "filter": {"state": ["SUCCEEDED"]}}
+    with TestClient(create_app(settings, start_worker=False)) as c:
+        for _ in range(5):
+            r = c.post("/events/batch", json=payload)
+            assert r.status_code == 200
+            assert r.json()["matched"] == 0 and r.json()["changed"] == []
+
+    assert _snapshot(storage) == before_states
+    # 只有 5 行 changed_count=0 的诚实审计；没有任何事件历史被写入
+    with storage._write_lock:
+        tagged = storage.conn.execute(
+            "SELECT COUNT(*) AS n FROM event_history WHERE batch_id IS NOT NULL"
+        ).fetchone()["n"]
+        fake = storage.conn.execute(
+            "SELECT COUNT(*) AS n FROM manual_batches WHERE changed_count <> 0"
+        ).fetchone()["n"]
+    assert tagged == 0 and fake == 0
+    assert storage.get_event("unk").state is EventState.DEAD
+    assert storage.get_event("biz").state is EventState.FAILED
+    _ = ids
+
+
+def test_zero_match_filter_while_worker_running(settings, storage, pipeline):
+    """零命中批量与后台投递并发：始终只返回真正满足条件且可处置的事件。"""
+    import threading
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor
+
+    pipeline.receive("fly", "t", {"simulate": {"mode": "business"}},
+                     trace_id="tr-fly")
+    pipeline.receive("goner", "t", {"simulate": {"mode": "unknown"}},
+                     trace_id="tr-gone")
+
+    stop = threading.Event()
+
+    def worker_rounds():
+        end = _t.time() + 2
+        while _t.time() < end and not stop.is_set():
+            cid = new_correlation_id()
+            eid = storage.claim_next(_t.time(), cid)
+            if eid:
+                pipeline.process_once(eid, cid)
+            else:
+                _t.sleep(0.001)
+
+    t = threading.Thread(target=worker_rounds, daemon=True)
+    t.start()
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool, \
+                TestClient(create_app(settings, start_worker=False)) as c:
+            futs = []
+            # 只用不可处置状态反复圈选；无论 worker 把事件带到什么状态都不得卷入
+            for states in (["SUCCEEDED"], ["PENDING"], ["PROCESSING"],
+                           ["DISCARDED"], ["SUCCEEDED", "PENDING"]):
+                for _ in range(10):
+                    futs.append(pool.submit(
+                        lambda ss=states: c.post(
+                            "/events/batch",
+                            json={"action": "discard", "filter": {"state": ss}}
+                        ).json()))
+            for f in futs:
+                assert f.result()["changed"] == []
+    finally:
+        stop.set()
+        t.join(timeout=5)
+
+    # goner 最终 DEAD（没被批量误伤）；没有事件被这些批量置为 DISCARDED
+    assert storage.get_event("goner").state is EventState.DEAD
+    with storage._write_lock:
+        disc = storage.conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE state='DISCARDED'"
+        ).fetchone()["n"]
+        tagged = storage.conn.execute(
+            "SELECT COUNT(*) AS n FROM event_history WHERE to_state='DISCARDED'"
+        ).fetchone()["n"]
+    assert disc == 0 and tagged == 0
+    assert storage.stats()["side_effect_count"] == 0
+
+
+def test_list_events_empty_states_returns_empty_without_full_scan(settings, storage,
+                                                                  pipeline, clock):
+    """存储层防御：states=[]（空集）必须返回空，而不是像 states=None 那样全表列出。"""
+    _seed_mixed_terminal_states(storage, pipeline, clock)
+    assert storage.list_events(states=[]) == []
+    assert storage.list_events(states=[], trace_id="trace-dead") == []
+    # None 仍是无条件全列（GET /events 不带 state 时的语义）
+    assert {e.event_id for e in storage.list_events()} == {
+        "ok", "biz", "unk", "pending"}
+
+
+def test_explicit_ids_still_disposed_when_filter_matches_nothing(
+        settings, storage, pipeline, clock):
+    """显式 event_ids 与 filter 并存：filter 零命中不影响显式给出的可处置事件被处置；
+    显式给出的不可处置事件仍只进 skipped_terminal，绝不被卷入。"""
+    ids = _seed_mixed_terminal_states(storage, pipeline, clock)
+    with TestClient(create_app(settings, start_worker=False)) as c:
+        r = c.post("/events/batch", json={
+            "action": "discard",
+            "event_ids": ["unk", "ok", "missing"],
+            "filter": {"state": ["SUCCEEDED"]},  # 零命中，不得扩大圈选
+        })
+        body = r.json()
+        assert body["changed"] == ["unk"], body
+        assert body["skipped_terminal"] == ["ok"], body
+        assert body["not_found"] == ["missing"], body
+    assert storage.get_event("unk").state is EventState.DISCARDED
+    assert storage.get_event("biz").state is EventState.FAILED, "filter 不得把 biz 卷进来"
+    assert storage.get_event("ok").state is EventState.SUCCEEDED
+    assert storage.side_effect_count("ok") == 1
+    _ = ids
